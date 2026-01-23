@@ -1,3 +1,56 @@
+"""
+A2C (Advantage Actor-Critic) 算法实现 - 详细注释版
+
+═══════════════════════════════════════════════════════════════════════════════
+算法概览
+═══════════════════════════════════════════════════════════════════════════════
+
+A2C是同步版的Actor-Critic算法，融合了策略梯度（Actor）与价值估计（Critic）。
+核心思想：使用Critic估计优势函数，指导Actor更新，从而降低策略梯度的方差。
+
+核心要点：
+- 使用GAE (Generalized Advantage Estimation) 计算优势函数
+- Actor最大化 log π(a|s) * Advantage
+- Critic最小化 (V(s) - return)^2
+- 通过熵正则鼓励探索
+
+═══════════════════════════════════════════════════════════════════════════════
+A2C vs REINFORCE 对比
+═══════════════════════════════════════════════════════════════════════════════
+
+特性              | REINFORCE             | A2C (同步Actor-Critic)
+-----------------|------------------------|------------------------------
+学习方式          | 纯策略梯度             | Actor-Critic
+优势估计          | Monte Carlo return     | GAE优势估计
+方差             | 高                      | 更低
+稳定性            | 较差                    | 更好
+数据使用          | On-Policy               | On-Policy
+
+═══════════════════════════════════════════════════════════════════════════════
+执行流程 Chain
+═══════════════════════════════════════════════════════════════════════════════
+
+训练一个epoch的流程：
+1. 【数据收集】Collector用当前策略收集N步数据 → Buffer
+2. 【预处理】_add_returns_and_advantages:
+   - 计算GAE优势函数 A(s,a)
+   - 计算returns
+3. 【策略更新】_update_with_batch:
+   a) Actor: 最小化 -log π(a|s) * Advantage
+   b) Critic: 最小化 (V(s) - return)^2
+   c) Entropy: 最大化策略熵（探索）
+4. 【参数更新】组合总loss，反向传播更新
+
+关键数据流：
+Environment → Collector → Buffer → A2C._add_returns_and_advantages
+                                      ↓
+                            A2C._update_with_batch
+                                      ↓
+                            Policy & Critic 更新
+
+═══════════════════════════════════════════════════════════════════════════════
+"""
+
 from abc import ABC
 from dataclasses import dataclass
 from typing import cast
@@ -22,6 +75,18 @@ from tianshou.utils.net.discrete import DiscreteCritic
 
 @dataclass(kw_only=True)
 class A2CTrainingStats(TrainingStats):
+    """
+    A2C训练统计信息
+
+    用于记录训练过程中各类loss的统计量，便于监控训练稳定性与收敛情况。
+
+    字段说明：
+    - loss: 总loss统计
+    - actor_loss: Actor策略loss统计
+    - vf_loss: Critic价值loss统计
+    - ent_loss: 熵正则项loss统计
+    - gradient_steps: 梯度更新步数
+    """
     loss: SequenceSummaryStats
     actor_loss: SequenceSummaryStats
     vf_loss: SequenceSummaryStats
@@ -30,7 +95,16 @@ class A2CTrainingStats(TrainingStats):
 
 
 class ActorCriticOnPolicyAlgorithm(OnPolicyAlgorithm[ProbabilisticActorPolicy], ABC):
-    """Abstract base class for actor-critic algorithms that use generalized advantage estimation (GAE)."""
+    """
+    Actor-Critic on-policy算法基类（使用GAE）
+
+    该基类封装了：
+    - Critic网络的管理
+    - GAE优势估计的计算流程
+    - return与advantage的标准化/缩放逻辑
+
+    子类（如A2C、PPO）可直接复用这些通用逻辑。
+    """
 
     def __init__(
         self,
@@ -46,6 +120,14 @@ class ActorCriticOnPolicyAlgorithm(OnPolicyAlgorithm[ProbabilisticActorPolicy], 
         return_scaling: bool = False,
     ) -> None:
         """
+        初始化Actor-Critic基类
+
+        主要职责：
+        - 保存critic网络
+        - 构建优化器（可选包含actor参数）
+        - 设置GAE与折扣因子
+        - 初始化return的运行时标准化器
+
         :param critic: the critic network. (s -> V(s))
         :param optim: the optimizer factory.
         :param optim_include_actor: whether the optimizer shall include the actor network's parameters.
@@ -118,7 +200,17 @@ class ActorCriticOnPolicyAlgorithm(OnPolicyAlgorithm[ProbabilisticActorPolicy], 
         buffer: ReplayBuffer,
         indices: np.ndarray,
     ) -> BatchWithAdvantagesProtocol:
-        """Adds the returns and advantages to the given batch."""
+        """
+        为batch添加returns与advantages（GAE）
+
+        执行步骤：
+        1) 用critic计算 V(s) 与 V(s')
+        2) 根据GAE计算优势 A(s,a)
+        3) 计算returns，并按需进行缩放
+        4) 将returns与advantage转为torch张量
+
+        :return: 增加了 returns/adv/v_s 的batch
+        """
         v_s, v_s_ = [], []
         with torch.no_grad():
             for minibatch in batch.split(self.max_batchsize, shuffle=False, merge_last=True):
@@ -154,7 +246,16 @@ class ActorCriticOnPolicyAlgorithm(OnPolicyAlgorithm[ProbabilisticActorPolicy], 
 
 
 class A2C(ActorCriticOnPolicyAlgorithm):
-    """Implementation of (synchronous) Advantage Actor-Critic (A2C). arXiv:1602.01783."""
+    """
+    A2C (同步Advantage Actor-Critic) 算法实现
+
+    论文: https://arxiv.org/abs/1602.01783
+
+    A2C核心：
+    - Actor负责策略更新（最大化优势）
+    - Critic负责价值估计（降低方差）
+    - 通过熵正则项提升探索
+    """
 
     def __init__(
         self,
@@ -171,6 +272,12 @@ class A2C(ActorCriticOnPolicyAlgorithm):
         return_scaling: bool = False,
     ) -> None:
         """
+        A2C初始化
+
+        关键参数：
+        - vf_coef: 价值函数loss权重
+        - ent_coef: 熵正则项权重（鼓励探索）
+
         :param policy: the policy containing the actor network.
         :param critic: the critic network. (s -> V(s))
         :param optim: the optimizer factory.
@@ -242,6 +349,12 @@ class A2C(ActorCriticOnPolicyAlgorithm):
         buffer: ReplayBuffer,
         indices: np.ndarray,
     ) -> BatchWithAdvantagesProtocol:
+        """
+        预处理batch：添加returns与advantages，并转换动作类型。
+
+        - returns/adv由基类GAE计算
+        - act转换为与value相同的tensor类型
+        """
         batch = self._add_returns_and_advantages(batch, buffer, indices)
         batch.act = to_torch_as(batch.act, batch.v_s)
         return batch
@@ -252,6 +365,15 @@ class A2C(ActorCriticOnPolicyAlgorithm):
         batch_size: int | None,
         repeat: int,
     ) -> A2CTrainingStats:
+        """
+        A2C核心训练逻辑
+
+        训练流程：
+        1) 计算Actor loss: -log π(a|s) * Advantage
+        2) 计算Critic loss: MSE(V(s), return)
+        3) 计算Entropy bonus
+        4) 合并总loss并更新参数
+        """
         losses, actor_losses, vf_losses, ent_losses = [], [], [], []
         split_batch_size = batch_size or -1
         gradient_steps = 0
@@ -259,16 +381,17 @@ class A2C(ActorCriticOnPolicyAlgorithm):
             for minibatch in batch.split(split_batch_size, merge_last=True):
                 gradient_steps += 1
 
-                # calculate loss for actor
+                # Step 1: 计算Actor loss（策略梯度）
                 dist = self.policy(minibatch).dist
                 log_prob = dist.log_prob(minibatch.act)
                 log_prob = log_prob.reshape(len(minibatch.adv), -1).transpose(0, 1)
                 actor_loss = -(log_prob * minibatch.adv).mean()
-                # calculate loss for critic
+                # Step 2: 计算Critic loss（价值回归）
                 value = self.critic(minibatch.obs).flatten()
                 vf_loss = F.mse_loss(minibatch.returns, value)
-                # calculate regularization and overall loss
+                # Step 3: 计算熵正则项（鼓励探索）
                 ent_loss = dist.entropy().mean()
+                # Step 4: 组合总loss并更新
                 loss = actor_loss + self.vf_coef * vf_loss - self.ent_coef * ent_loss
                 self.optim.step(loss)
                 actor_losses.append(actor_loss.item())
@@ -288,3 +411,41 @@ class A2C(ActorCriticOnPolicyAlgorithm):
             ent_loss=ent_loss_summary_stat,
             gradient_steps=gradient_steps,
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# A2C算法关键概念总结
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# 1. Actor-Critic 架构:
+#    ─────────────────
+#    - Actor负责策略更新，最大化期望回报
+#    - Critic负责估计价值函数V(s)，降低方差
+#
+# 2. GAE (Generalized Advantage Estimation):
+#    ───────────────────────────────────────
+#    A^GAE(γ,λ)_t = Σ_{l=0}^∞ (γλ)^l δ_{t+l}
+#    其中 δ_t = r_t + γV(s_{t+1}) - V(s_t)
+#
+# 3. A2C Loss 公式:
+#    ───────────────
+#    L = L_actor + c1 * L_vf - c2 * L_entropy
+#
+#    - L_actor = -E[log π(a|s) * Advantage]
+#    - L_vf    = MSE(V(s), return)
+#    - L_entropy 鼓励探索，避免策略过早收敛
+#
+# 4. 与PPO的关系:
+#    ────────────────
+#    - PPO在A2C基础上增加了clipping约束
+#    - A2C更简单，但策略更新可能更不稳定
+#
+# 5. 典型超参数:
+#    ────────────────
+#    vf_coef = 0.5
+#    ent_coef = 0.01
+#    gae_lambda = 0.95
+#    gamma = 0.99
+#    max_grad_norm = 0.5
+#
+# ═══════════════════════════════════════════════════════════════════════════════
